@@ -19,9 +19,11 @@ import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent (threadDelay)
 import Control.Exception (throwIO)
 import Control.Monad (forever)
+import Control.Monad.Loops (whileM_)
 import qualified Data.ByteString.Char8 as ByteString
 import Data.ByteString.Char8 (ByteString)
 import Data.Default.Class (def)
+import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.ProtoLens.Service.Types (Service(..), HasMethod, HasMethodImpl(..), StreamingType(..))
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
@@ -49,12 +51,16 @@ data GrpcClient = GrpcClient {
   -- ^ Running background tasks.
   }
 
-data BackgroundTasks = BackgroundTasks {
-    backgroundWindowUpdate :: Async ()
-  -- ^ Periodically give the server credit to use the connection.
-  , backgroundPing         :: Async ()
-  -- ^ Periodically ping the server.
-  }
+-- data BackgroundTasks = BackgroundTasks {
+--     backgroundWindowUpdate :: Async ()
+--   -- ^ Periodically give the server credit to use the connection.
+--   , backgroundPing         :: Async ()
+--   -- ^ Periodically ping the server.
+--   }
+
+-- | Periodically give the server credit to use the connection. It also pings
+--   the server periodically.
+newtype BackgroundTasks = BackgroundTasks (CloseLatch)
 
 -- | Configuration to setup a GrpcClient.
 data GrpcClientConfig = GrpcClientConfig {
@@ -101,6 +107,23 @@ tlsSettings True host port = Just $ TLS.ClientParams {
         }
 
 
+data LatchState = Open | Close deriving (Show, Eq)
+
+newtype CloseLatch = CloseLatch (IORef LatchState)
+
+newCloseLatch :: IO CloseLatch
+newCloseLatch = CloseLatch <$> newIORef Open
+
+closeLatchRelease :: CloseLatch -> IO ()
+closeLatchRelease (CloseLatch ref) = atomicWriteIORef ref Close
+
+closeLatchIsOpen :: CloseLatch -> IO Bool
+closeLatchIsOpen (CloseLatch ref) = do
+  st <- readIORef ref
+  case st of
+    Open  -> pure True
+    Close -> pure False
+
 setupGrpcClient :: GrpcClientConfig -> IO GrpcClient
 setupGrpcClient config = do
   let host = _grpcClientConfigHost config
@@ -115,21 +138,23 @@ setupGrpcClient config = do
 
   conn <- newHttp2FrameConnection host port tls
   cli <- newHttp2Client conn 8192 8192 [] onGoAway onFallback
-  wuAsync <- async $ forever $ do
+  latch <- newCloseLatch
+  _ <- async $ whileM_ (closeLatchIsOpen latch) $ do
       threadDelay $ _grpcClientConfigWindowUpdateDelay config
       _updateWindow $ _incomingFlowControl cli
-  pingAsync <- async $ forever $ do
+  _ <- async $ whileM_ (closeLatchIsOpen latch) $ do
       threadDelay $ _grpcClientConfigPingDelay config
       ping cli 3000000 "grpc.hs"
-  let tasks = BackgroundTasks wuAsync pingAsync
+  let tasks = BackgroundTasks latch
   return $ GrpcClient cli authority headers timeout compression tasks
 
 -- | Cancels background tasks and closes the underlying HTTP2 client.
 close :: GrpcClient -> IO ()
 close grpc = do
-    cancel $ backgroundPing $ _grpcClientBackground grpc
-    cancel $ backgroundWindowUpdate $ _grpcClientBackground grpc
+    closeLatchRelease latch
     _close $ _grpcClientHttp2Client grpc
+  where
+    BackgroundTasks latch = _grpcClientBackground grpc
 
 -- | Run an unary query.
 rawUnary
