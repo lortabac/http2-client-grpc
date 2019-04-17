@@ -60,6 +60,7 @@ module Network.GRPC.Client (
   , streamRequest
   , steppedBiDiStream
   , generalHandler
+  , runClientIO_
   , CompressMode(..)
   , StreamDone(..)
   , BiDiStep(..)
@@ -82,7 +83,7 @@ module Network.GRPC.Client (
   ) where
 
 import Control.Concurrent.Async (concurrently)
-import Control.Exception (SomeException, Exception(..), throwIO)
+import Control.Exception (SomeException, Exception(..), throw)
 import Data.ByteString.Char8 (unpack)
 import Data.ByteString.Lazy (toStrict)
 import Data.Binary.Builder (toLazyByteString)
@@ -124,12 +125,15 @@ instance Exception UnallowedPushPromiseReceived where
 
 -- | http2-client handler for push promise.
 throwOnPushPromise :: PushPromiseHandler
-throwOnPushPromise _ _ _ _ _ = throwIO UnallowedPushPromiseReceived
+throwOnPushPromise _ _ _ _ _ = throw UnallowedPushPromiseReceived
+
+runClientIO_ :: ClientIO a -> IO a
+runClientIO_ m = either throw id <$> runClientIO m
 
 -- | Wait for an RPC reply.
 waitReply :: (Service s, HasMethod s m) => RPC s m -> Decoding -> Http2Stream -> IncomingFlowControl -> IO (RawReply (MethodOutput s m))
 waitReply rpc decoding stream flowControl = do
-    format . fromStreamResult <$> waitStream stream flowControl throwOnPushPromise
+    runClientIO_ (format . fromStreamResult <$> waitStream stream flowControl throwOnPushPromise)
   where
     decompress = _getDecodingCompression decoding
     format rsp = do
@@ -200,12 +204,12 @@ open conn authority extraheaders timeout encoding decoding call = do
                   , ("content-type", grpcContentTypeHV)
                   , ("te", "trailers")
                   ] <> extraheaders
-    withHttp2Stream conn $ \stream ->
+    runClientIO_ $ withHttp2Stream conn $ \stream ->
         let
             initStream = headers stream request (setEndHeader)
             handler isfc osfc = do
                 (runRPC call) conn stream isfc osfc encoding decoding
-        in StreamDefinition initStream handler
+        in StreamDefinition initStream (\x -> lift . handler x)
 
 -- | gRPC call for Server Streaming.
 streamReply
@@ -221,27 +225,27 @@ streamReply
   -> RPCCall s m (a, HeaderList, HeaderList)
 streamReply rpc v0 req handler = RPCCall $ \conn stream isfc osfc encoding decoding -> do
     let {
-        loop v1 decode hdrs = _waitEvent stream >>= \case
+        loop v1 decode hdrs = runClientIO_ $ _waitEvent stream >>= \case
             (StreamPushPromiseEvent _ _ _) ->
-                throwIO UnallowedPushPromiseReceived
+                throw UnallowedPushPromiseReceived
             (StreamHeadersEvent _ trls) ->
                 return (v1, hdrs, trls)
             (StreamErrorEvent _ _) ->
-                throwIO (InvalidState "stream error")
+                throw (InvalidState "stream error")
             (StreamDataEvent _ dat) -> do
-                _addCredit isfc (ByteString.length dat)
-                _ <- _consumeCredit isfc (ByteString.length dat)
+                lift $ _addCredit isfc (ByteString.length dat)
+                _ <- lift $ _consumeCredit isfc (ByteString.length dat)
                 _ <- _updateWindow isfc
-                handleAllChunks decoding v1 hdrs decode dat loop
+                lift $ handleAllChunks decoding v1 hdrs decode dat loop
     } in do
         let ocfc = _outgoingFlowControl conn
         let decompress = _getDecodingCompression decoding
         sendSingleMessage rpc req encoding setEndStream conn ocfc stream osfc
-        _waitEvent stream >>= \case
+        runClientIO_ $ _waitEvent stream >>= \case
             StreamHeadersEvent _ hdrs ->
-                loop v0 (decodeOutput rpc decompress) hdrs
+                lift $ loop v0 (decodeOutput rpc decompress) hdrs
             _                         ->
-                throwIO (InvalidState "no headers")
+                throw (InvalidState "no headers")
   where
     handleAllChunks decoding v1 hdrs decode dat exitLoop =
        case pushChunk decode dat of
@@ -250,9 +254,9 @@ streamReply rpc v0 req handler = RPCCall $ \conn stream isfc osfc encoding decod
                let decompress = _getDecodingCompression decoding
                handleAllChunks decoding v2 hdrs (decodeOutput rpc decompress) unusedDat exitLoop
            (Done _ _ (Left err)) -> do
-               throwIO (StreamReplyDecodingError $ "done-error: " ++ err)
+               throw (StreamReplyDecodingError $ "done-error: " ++ err)
            (Fail _ _ err)                 -> do
-               throwIO (StreamReplyDecodingError $ "fail-error: " ++ err)
+               throw (StreamReplyDecodingError $ "fail-error: " ++ err)
            partial@(Partial _)    ->
                exitLoop v1 partial hdrs
 
@@ -282,7 +286,7 @@ streamRequest rpc v0 handler = RPCCall $ \conn stream isfc streamFlowControl enc
                     sendSingleMessage rpc msg (Encoding compress) id conn ocfc stream streamFlowControl
                     go v2
                 Left _ -> do
-                    sendData conn stream setEndStream ""
+                    runClientIO_ $ sendData conn stream setEndStream ""
                     reply <- waitReply rpc decoding stream isfc
                     pure (v2, reply)
     in go v0
@@ -303,14 +307,14 @@ sendSingleMessage rpc msg encoding flagMod conn connectionFlowControl stream str
     let compress = _getEncodingCompression encoding
     let goUpload dat = do
             let !wanted = ByteString.length dat
-            gotStream <- _withdrawCredit streamFlowControl wanted
-            got       <- _withdrawCredit connectionFlowControl gotStream
+            gotStream <- runClientIO_ $ _withdrawCredit streamFlowControl wanted
+            got       <- runClientIO_ $ _withdrawCredit connectionFlowControl gotStream
             _receiveCredit streamFlowControl (gotStream - got)
             if got == wanted
             then
-                sendData conn stream flagMod dat
+                runClientIO_ $ sendData conn stream flagMod dat
             else do
-                sendData conn stream id (ByteString.take got dat)
+                runClientIO_ $ sendData conn stream id (ByteString.take got dat)
                 goUpload (ByteString.drop got dat)
     goUpload . toStrict . toLazyByteString . encodeInput rpc compress $ msg
 
@@ -364,7 +368,7 @@ steppedBiDiStream rpc v0 handler = RPCCall $ \conn stream isfc streamFlowControl
         newDecoder = decodeOutput rpc decompress
 
         goStep _ _ (v1, Abort) = do
-            sendData conn stream setEndStream ""
+            runClientIO_ $ sendData conn stream setEndStream ""
             pure v1
         goStep hdrs decode (v1, SendInput doCompress msg) = do
             let compress = case doCompress of
@@ -373,35 +377,35 @@ steppedBiDiStream rpc v0 handler = RPCCall $ \conn stream isfc streamFlowControl
             sendSingleMessage rpc msg (Encoding compress) id conn ocfc stream streamFlowControl
             handler v1 >>= goStep hdrs decode
         goStep jhdrs@(Just hdrs) decode unchanged@(v1, WaitOutput handleMsg handleEof) = do
-            _waitEvent stream >>= \case
+            runClientIO_ $ _waitEvent stream >>= \case
                 (StreamPushPromiseEvent _ _ _) ->
-                    throwIO UnallowedPushPromiseReceived
+                    throw UnallowedPushPromiseReceived
                 (StreamHeadersEvent _ trls) -> do
-                    v2 <- handleEof hdrs v1 trls
+                    v2 <- lift $ handleEof hdrs v1 trls
                     -- TODO: consider failing the decoder here
-                    handler v2 >>= goStep jhdrs newDecoder
+                    lift (handler v2 >>= goStep jhdrs newDecoder)
                 (StreamErrorEvent _ _) ->
-                    throwIO (InvalidState "stream error")
+                    throw (InvalidState "stream error")
                 (StreamDataEvent _ dat) -> do
-                    _addCredit isfc (ByteString.length dat)
-                    _ <- _consumeCredit isfc (ByteString.length dat)
+                    lift $ _addCredit isfc (ByteString.length dat)
+                    _ <- lift $ _consumeCredit isfc (ByteString.length dat)
                     _ <- _updateWindow isfc
                     case pushChunk decode dat of
                         (Done unusedDat _ (Right val)) -> do
-                            v2 <- handleMsg hdrs v1 val
-                            handler v2 >>= goStep jhdrs (pushChunk newDecoder unusedDat)
+                            v2 <- lift $ handleMsg hdrs v1 val
+                            lift (handler v2 >>= goStep jhdrs (pushChunk newDecoder unusedDat))
                         (Done _ _ (Left err)) -> do
-                            throwIO $ InvalidParse $ "done-err: " ++ err
+                            throw $ InvalidParse $ "done-err: " ++ err
                         (Fail _ _ err)         ->
-                            throwIO $ InvalidParse $ "done-fail: " ++ err
+                            throw $ InvalidParse $ "done-fail: " ++ err
                         partial@(Partial _)    -> do
-                            goStep jhdrs partial unchanged
+                            lift $ goStep jhdrs partial unchanged
         goStep Nothing decode unchanged = do
-            _waitEvent stream >>= \case
+            runClientIO_ $ _waitEvent stream >>= \case
                 (StreamHeadersEvent _ hdrs) ->
-                   goStep (Just hdrs) decode unchanged
+                   lift $ goStep (Just hdrs) decode unchanged
                 _ ->
-                   throwIO (InvalidState "no headers")
+                   throw (InvalidState "no headers")
 
     in handler v0 >>= goStep Nothing newDecoder
 
@@ -465,7 +469,7 @@ generalHandler rpc v0 handle w0 next = RPCCall $ \conn stream isfc osfc encoding
              (v2, event) <- next v1
              case event of
                  Finalize -> do
-                    sendData conn stream setEndStream ""
+                    runClientIO_ $ sendData conn stream setEndStream ""
                     return v2
                  SendMessage doCompress msg -> do
                     let compress = case doCompress of
@@ -474,29 +478,29 @@ generalHandler rpc v0 handle w0 next = RPCCall $ \conn stream isfc osfc encoding
                     sendSingleMessage rpc msg (Encoding compress) id conn ocfc stream osfc
                     outGoingLoop v2
         incomingLoop Nothing decode v1 =
-                _waitEvent stream >>= \case
+                runClientIO_ $ _waitEvent stream >>= \case
                     (StreamHeadersEvent _ hdrs) ->
-                       handle v1 (Headers hdrs) >>= incomingLoop (Just hdrs) decode
+                       lift (handle v1 (Headers hdrs) >>= incomingLoop (Just hdrs) decode)
                     _ ->
-                       handle v1 (Invalid $ toException $ InvalidState "no headers")
+                       lift $ handle v1 (Invalid $ toException $ InvalidState "no headers")
         incomingLoop jhdrs decode v1 =
-            _waitEvent stream >>= \case
+            runClientIO_ $ _waitEvent stream >>= \case
                 (StreamHeadersEvent _ hdrs) ->
-                    handle v1 (Trailers hdrs)
+                    lift $ handle v1 (Trailers hdrs)
                 (StreamDataEvent _ dat) -> do
-                    _addCredit isfc (ByteString.length dat)
-                    _ <- _consumeCredit isfc (ByteString.length dat)
+                    lift $ _addCredit isfc (ByteString.length dat)
+                    _ <- lift $ _consumeCredit isfc (ByteString.length dat)
                     _ <- _updateWindow isfc
                     case pushChunk decode dat of
                         (Done unusedDat _ (Right val)) ->
-                            handle v1 (RecvMessage val) >>= incomingLoop jhdrs (pushChunk newDecoder unusedDat)
+                            lift (handle v1 (RecvMessage val) >>= incomingLoop jhdrs (pushChunk newDecoder unusedDat))
                         partial@(Partial _)    -> do
-                            incomingLoop jhdrs partial v1
+                            lift $ incomingLoop jhdrs partial v1
                         (Done _ _ (Left err)) -> do
-                            handle v1 (Invalid $ toException $ InvalidParse $ "invalid-done-parse: " ++ err)
+                            lift $ handle v1 (Invalid $ toException $ InvalidParse $ "invalid-done-parse: " ++ err)
                         (Fail _ _ err)         ->
-                            handle v1 (Invalid $ toException $ InvalidParse $ "invalid-parse: " ++ err)
+                            lift $ handle v1 (Invalid $ toException $ InvalidParse $ "invalid-parse: " ++ err)
                 (StreamPushPromiseEvent _ _ _) ->
-                    handle v1 (Invalid $ toException UnallowedPushPromiseReceived)
+                    lift $ handle v1 (Invalid $ toException UnallowedPushPromiseReceived)
                 (StreamErrorEvent _ _) ->
-                    handle v1 (Invalid $ toException $ InvalidState "stream error")
+                    lift $ handle v1 (Invalid $ toException $ InvalidState "stream error")

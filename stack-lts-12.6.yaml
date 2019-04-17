@@ -1,8 +1,11 @@
 resolver: lts-12.6
 packages:
 - .
+- location:
+    git: https://github.com/lortabac/http2-client
+    commit: 32b9d551a9747b9fc8593dadba61ec7caffe3ff6
+  extra-dep: true
 extra-deps:
-- http2-client-0.8.0.1
 - http2-grpc-types-0.3.0.0
 - lens-labels-0.3.0.0
 - proto-lens-0.4.0.0

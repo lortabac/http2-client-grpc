@@ -17,7 +17,7 @@ module Network.GRPC.Client.Helpers where
 import Control.Lens
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent (threadDelay)
-import Control.Exception (throwIO)
+import Control.Exception (throw)
 import Control.Monad (forever)
 import qualified Data.ByteString.Char8 as ByteString
 import Data.ByteString.Char8 (ByteString)
@@ -29,7 +29,7 @@ import Network.HPACK (HeaderList)
 
 import Network.HTTP2.Client (newHttp2FrameConnection, newHttp2Client, Http2Client(..), IncomingFlowControl(..), GoAwayHandler, FallBackFrameHandler, ignoreFallbackHandler, HostName, PortNumber, TooMuchConcurrency)
 import Network.HTTP2.Client.Helpers (ping)
-import Network.GRPC.Client (RPC, open, singleRequest, streamReply, streamRequest, steppedBiDiStream, generalHandler, Authority, Timeout(..), StreamDone, CompressMode, RawReply, RunBiDiStep, IncomingEvent(..), OutgoingEvent(..))
+import Network.GRPC.Client (RPC, open, singleRequest, streamReply, streamRequest, steppedBiDiStream, generalHandler, runClientIO_, Authority, Timeout(..), StreamDone, CompressMode, RawReply, RunBiDiStep, IncomingEvent(..), OutgoingEvent(..))
 import Network.GRPC.HTTP2.Encoding (Compression, Encoding(..), Decoding(..), gzip)
 
 -- | A simplified gRPC Client connected via an HTTP2Client to a given server.
@@ -82,7 +82,7 @@ data GrpcClientConfig = GrpcClientConfig {
 
 grpcClientConfigSimple :: HostName -> PortNumber -> UseTlsOrNot -> GrpcClientConfig
 grpcClientConfigSimple host port tls =
-    GrpcClientConfig host port [] (Timeout 3000) gzip (tlsSettings tls host port) throwIO ignoreFallbackHandler 5000000 1000000
+    GrpcClientConfig host port [] (Timeout 3000) gzip (tlsSettings tls host port) throw ignoreFallbackHandler 5000000 1000000
 
 type UseTlsOrNot = Bool
 
@@ -113,14 +113,14 @@ setupGrpcClient config = do
   let headers = _grpcClientConfigHeaders config
   let authority = ByteString.pack $ host <> ":" <> show port
 
-  conn <- newHttp2FrameConnection host port tls
-  cli <- newHttp2Client conn 8192 8192 [] onGoAway onFallback
+  conn <- runClientIO_ $ newHttp2FrameConnection host port tls
+  cli <- runClientIO_ $ newHttp2Client conn 8192 8192 [] onGoAway onFallback
   wuAsync <- async $ forever $ do
       threadDelay $ _grpcClientConfigWindowUpdateDelay config
-      _updateWindow $ _incomingFlowControl cli
+      runClientIO_ $ _updateWindow $ _incomingFlowControl cli
   pingAsync <- async $ forever $ do
       threadDelay $ _grpcClientConfigPingDelay config
-      ping cli 3000000 "grpc.hs"
+      runClientIO_ $ ping cli 3000000 "grpc.hs"
   let tasks = BackgroundTasks wuAsync pingAsync
   return $ GrpcClient cli authority headers timeout compression tasks
 
@@ -129,7 +129,7 @@ close :: GrpcClient -> IO ()
 close grpc = do
     cancel $ backgroundPing $ _grpcClientBackground grpc
     cancel $ backgroundWindowUpdate $ _grpcClientBackground grpc
-    _close $ _grpcClientHttp2Client grpc
+    runClientIO_ $ _close $ _grpcClientHttp2Client grpc
 
 -- | Run an unary query.
 rawUnary
